@@ -1,0 +1,33 @@
+
+name: Perbarui cuaca BMKG dan jadwal shalat Paloh Gadeng
+
+on:
+  schedule:
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Ambil data BMKG
+        run: python fetch_bmkg.py
+      - name: Ambil data jadwal shalat
+        run: python fetch_shalat.py
+      - name: Simpan JSON baru
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bmkg.json shalat.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'update: BMKG dan shalat Paloh Gadeng'
+            git push
+          fi
