@@ -1,10 +1,9 @@
-
 name: Perbarui cuaca BMKG dan jadwal shalat Paloh Gadeng
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '17 1,7,13,19 * * *'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,20 +13,54 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repositori
+        uses: actions/checkout@v4
+
+      - name: Pasang Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Ambil data BMKG
+        id: bmkg
+        continue-on-error: true
         run: python fetch_bmkg.py
+
       - name: Ambil data jadwal shalat
+        id: shalat
+        continue-on-error: true
         run: python fetch_shalat.py
-      - name: Simpan JSON baru
+
+      - name: Simpan JSON yang berhasil diperbarui
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add bmkg.json shalat.json
+          for file in bmkg.json shalat.json; do
+            if [ -f "$file" ]; then
+              git add -- "$file"
+            else
+              echo "Belum ada $file; lewati."
+            fi
+          done
           if ! git diff --cached --quiet; then
-            git commit -m 'update: BMKG dan shalat Paloh Gadeng'
+            git commit -m 'update: data BMKG dan jadwal shalat'
             git push
+          else
+            echo 'Tidak ada perubahan data yang perlu disimpan.'
+          fi
+
+      - name: Ringkasan hasil sumber data
+        if: always()
+        run: |
+          echo "BMKG: ${{ steps.bmkg.outcome }}"
+          echo "Shalat: ${{ steps.shalat.outcome }}"
+          if [[ "${{ steps.bmkg.outcome }}" == 'failure' ]]; then
+            echo '::warning::Sumber BMKG gagal. File BMKG lama dipertahankan bila ada.'
+          fi
+          if [[ "${{ steps.shalat.outcome }}" == 'failure' ]]; then
+            echo '::warning::Sumber shalat gagal. File shalat lama dipertahankan bila ada.'
+          fi
+          if [[ "${{ steps.bmkg.outcome }}" == 'failure' && "${{ steps.shalat.outcome }}" == 'failure' ]]; then
+            echo '::error::Kedua sumber data gagal diperbarui.'
+            exit 1
           fi
