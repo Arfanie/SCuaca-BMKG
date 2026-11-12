@@ -1,0 +1,33 @@
+name: Perbarui prakiraan BMKG Paloh Gadeng
+
+on:
+  schedule:
+    # 01:17, 07:17, 13:17, 19:17 UTC = 08:17, 14:17, 20:17, 02:17 WIB
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch validated BMKG JSON
+        run: python fetch_bmkg.py
+      - name: Commit updated JSON
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bmkg.json
+          if ! git diff --cached --quiet; then
+            git commit -m "update: prakiraan BMKG Paloh Gadeng"
+            git push
+          fi
