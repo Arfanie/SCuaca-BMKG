@@ -1,108 +1,184 @@
 #!/usr/bin/env python3
-"""SAKA Smart Display: 10-day rolling Bimas Islam Kemenag prayer times for
-Kabupaten Aceh Utara, through Sajadah's public *mirror* of official timetables.
-This is not an official Kemenag API; compare against SIHAT/your local mosque.
-Automatically run in GitHub Actions; failed requests leave old data intact.
+"""Rd Smart Display: jadwal shalat Aceh Utara (WIB) untuk 10 hari.
+
+Sumber utama: myQuran API v3, cadangan: myQuran API v2.
+Keduanya layanan pihak ketiga yang menyatakan memakai data Bimas Islam
+Kemenag RI, bukan akses resmi langsung ke Kemenag.
+
+Menulis shalat.json hanya setelah seluruh tanggal & jam tervalidasi.
+Jalankan dengan `python fetch_shalat.py` (Python >=3.9).
 """
+from __future__ import annotations
 import json
 import re
-from datetime import datetime, timedelta
+import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Jakarta")
-TODAY = datetime.now(TZ).date()
+ROOT = Path(__file__).resolve().parent
+OUTPUT = ROOT / "shalat.json"
 DAYS = 10
-BASE = "https://sajadah.org/api/v1"
-OUT = Path(__file__).resolve().parent / "shalat.json"
-TIME_FIELDS = {
-    "imsak": "imsak", "fajr": "subuh", "sunrise": "terbit",
-    "dhuhr": "dzuhur", "asr": "ashar", "maghrib": "maghrib", "isha": "isya",
-}
+V3_CITY_ID = "6512bd43d9caa6e02c990b0a82652dca"  # KAB. ACEH UTARA
+V2_CITY_ID = "0111"  # KAB. ACEH UTARA
+FIELDS = ("imsak", "subuh", "terbit", "dzuhur", "ashar", "maghrib", "isya")
+TIME_RX = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 
-def get_json(url, maximum=900000):
+
+def get_json(url: str) -> dict:
     request = Request(url, headers={
-        "User-Agent": "SAKA-Smart-Display/1.9 (prayer-table-cache)",
         "Accept": "application/json",
+        "User-Agent": "Rd-Smart-Display/2.3 (prayer-data; GitHub Actions)",
     })
-    with urlopen(request, timeout=35) as response:
-        if response.status != 200:
-            raise RuntimeError(f"HTTP {response.status}: {url}")
-        data = response.read(maximum + 1)
-        if len(data) > maximum:
-            raise RuntimeError("JSON melebihi batas ukuran")
-    return json.loads(data)
+    with urlopen(request, timeout=20) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}: {url}")
+        raw = resp.read(650001)
+    if len(raw) > 650000:
+        raise RuntimeError("Respons JSON terlalu besar")
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get("status") is not True:
+        raise ValueError("Status respons API tidak sukses")
+    return data
 
-def norm(s):
-    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
 
-index = get_json(BASE + "/regions.json", 900000)
-regions = index.get("regions", [])
-# Do not guess an ID; locate the exact district in the official mirror's index.
-candidates = [r for r in regions if
-    r.get("country", "").upper() == "ID" and
-    r.get("authority") == "kemenag" and
-    norm(r.get("province", "")) == "aceh" and
-    norm(r.get("nameOfficial", r.get("name", ""))).replace("kab ", "kabupaten ") in
-      ("kabupaten aceh utara", "aceh utara")]
-if len(candidates) != 1:
-    raise RuntimeError(f"Kabupaten Aceh Utara ambiguous/unavailable in region index (found {len(candidates)})")
-region = candidates[0]
-region_id = region["id"]
+def normalized_name(value: object) -> str:
+    value = str(value or "").upper().replace("KABUPATEN", "KAB")
+    return re.sub(r"[^A-Z0-9]+", " ", value).strip()
 
-wanted = [(TODAY + timedelta(days=i)).isoformat() for i in range(DAYS)]
-years = sorted({int(date[:4]) for date in wanted})
-records = {}
-for year in years:
-    if year not in {int(y) for y in region.get("years", [])}:
-        raise RuntimeError(f"Tabel tahun {year} belum tersedia untuk {region_id}")
-    url = f"{BASE}/times/id/{quote(region_id, safe='')}/{year}.json"
-    payload = get_json(url, 500000)
-    if (payload.get("country") != "ID" or
-        payload.get("year") != year or
-        payload.get("region", {}).get("id") != region_id or
-        payload.get("region", {}).get("tz") != "Asia/Jakarta" or
-        payload.get("authority", {}).get("id") != "kemenag" or
-        payload.get("official") is not True):
-        raise ValueError("Response does not identify Kemenag Kabupaten Aceh Utara WIB")
-    fields = payload.get("fields", [])
-    for required in ["date", *TIME_FIELDS.keys()]:
-        if required not in fields:
-            raise ValueError(f"Missing field: {required}")
-    for values in payload.get("days", []):
-        if not isinstance(values, list) or len(values) != len(fields):
-            raise ValueError("Invalid daily record")
-        row = dict(zip(fields, values))
-        date = row["date"]
-        if date not in wanted:
+
+def assert_aceh_utara(location: str) -> None:
+    if normalized_name(location) != "KAB ACEH UTARA":
+        raise ValueError(f"Wilayah sumber salah: {location!r}")
+
+
+def canonical_date(raw: object, year: int, month: int) -> str:
+    if isinstance(raw, int) or (isinstance(raw, str) and raw.isdecimal()):
+        day = int(raw)
+        return date(year, month, day).isoformat()
+    if isinstance(raw, str):
+        try:
+            candidate = date.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"Tanggal tidak dikenali: {raw!r}") from exc
+        if (candidate.year, candidate.month) != (year, month):
+            raise ValueError(f"Tanggal berbeda bulan: {raw}")
+        return candidate.isoformat()
+    raise ValueError(f"Format tanggal tidak valid: {raw!r}")
+
+
+def clean_row(row: dict, day: str) -> dict:
+    output = {"date": day}
+    for field in FIELDS:
+        value = row.get(field)
+        if not isinstance(value, str) or not TIME_RX.fullmatch(value):
+            raise ValueError(f"Jam {field} salah pada {day}: {value!r}")
+        output[field] = value
+    if [output[k] for k in FIELDS] != sorted(output[k] for k in FIELDS):
+        raise ValueError(f"Urutan jam tidak wajar pada {day}")
+    return output
+
+
+def v3_month(data: dict, year: int, month: int) -> dict[str, dict]:
+    obj = data.get("data") or {}
+    if not isinstance(obj, dict):
+        raise ValueError("Respons v3.data bukan objek")
+    assert_aceh_utara(obj.get("kabko", ""))
+    if obj.get("id") and str(obj["id"]) != V3_CITY_ID:
+        raise ValueError("ID kota v3 tidak cocok")
+    if obj.get("prov") and normalized_name(obj.get("prov")) != "ACEH":
+        raise ValueError("Provinsi API v3 bukan Aceh")
+    schedule = obj.get("jadwal")
+    if not isinstance(schedule, (dict, list)):
+        raise ValueError("Tidak ada data jadwal bulanan v3")
+    out = {}
+    iterable = schedule.items() if isinstance(schedule, dict) else [(None, row) for row in schedule]
+    for key, row in iterable:
+        if not isinstance(row, dict):
             continue
-        result = {"date": date}
-        for source, dest in TIME_FIELDS.items():
-            value = row[source]
-            if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
-                raise ValueError(f"Invalid {source} for {date}: {value!r}")
-            result[dest] = value
-        order = [result[name] for name in ("imsak", "subuh", "terbit", "dzuhur", "ashar", "maghrib", "isya")]
-        if order != sorted(order):
-            raise ValueError(f"Unexpected daily order {date}")
-        records[date] = result
-if not all(date in records for date in wanted):
-    raise ValueError("Incomplete timetable; preserving previous shalat.json")
+        date_value = key or row.get("date") or row.get("tanggal")
+        day = canonical_date(date_value, year, month)
+        if day in out:
+            raise ValueError("Tanggal duplikat di v3")
+        out[day] = clean_row(row, day)
+    return out
 
-output = {
-    "location": "Kabupaten Aceh Utara", "authority": "kemenag",
-    "timezone": "Asia/Jakarta",
-    "source": "Sajadah public mirror of Bimas Islam Kemenag RI tables",
-    "mirror_region": region_id,
-    "note": "Jadwal kabupaten. Cocokkan dengan jadwal masjid Paloh Gadeng.",
-    "updated_at": datetime.now(TZ).isoformat(timespec="seconds"),
-    "days": [records[date] for date in wanted],
-}
 
-# Atomic replace avoids corrupting output on incomplete downloads.
-tmp = OUT.with_suffix(".tmp")
-tmp.write_text(json.dumps(output, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-tmp.replace(OUT)
-print(f"Updated {len(wanted)} days of Kemenag Aceh Utara data from Sajadah mirror, id={region_id}")
+def v2_month(data: dict, year: int, month: int) -> dict[str, dict]:
+    obj = data.get("data") or {}
+    if not isinstance(obj, dict):
+        raise ValueError("Respons v2.data bukan objek")
+    assert_aceh_utara(obj.get("lokasi", ""))
+    if obj.get("daerah") and normalized_name(obj["daerah"]) not in ("ACEH", "NANGGROE ACEH DARUSSALAM"):
+        raise ValueError("Provinsi API v2 bukan Aceh")
+    schedule = obj.get("jadwal")
+    if not isinstance(schedule, (dict, list)):
+        raise ValueError("Tidak ada data jadwal bulanan v2")
+    out = {}
+    iterable = schedule.items() if isinstance(schedule, dict) else [(None, row) for row in schedule]
+    for key, row in iterable:
+        if not isinstance(row, dict):
+            continue
+        date_value = row.get("date") or row.get("tanggal") or key
+        day = canonical_date(date_value, year, month)
+        if day in out:
+            raise ValueError("Tanggal duplikat di v2")
+        out[day] = clean_row(row, day)
+    return out
+
+
+def desired_days(today: date) -> list[str]:
+    return [(today + timedelta(days=i)).isoformat() for i in range(DAYS)]
+
+
+def collect(source: str, today: date) -> list[dict]:
+    needed = desired_days(today)
+    months = sorted({(int(d[:4]), int(d[5:7])) for d in needed})
+    records = {}
+    for year, month in months:
+        if source == "myQuran v3":
+            url = f"https://api.myquran.com/v3/sholat/jadwal/{V3_CITY_ID}/{year}-{month:02d}"
+            month_records = v3_month(get_json(url), year, month)
+        else:
+            url = f"https://api.myquran.com/v2/sholat/jadwal/{V2_CITY_ID}/{year}/{month}"
+            month_records = v2_month(get_json(url), year, month)
+        records.update(month_records)
+    missing = [d for d in needed if d not in records]
+    if missing:
+        raise RuntimeError(f"Tanggal belum ada dari {source}: {', '.join(missing)}")
+    return [records[d] for d in needed]
+
+
+def make_payload(rows: list[dict], source: str, now: datetime) -> dict:
+    return {
+        "location": "Kabupaten Aceh Utara",
+        "authority": "kemenag",  # identitas sumber jadwal yg dinyatakan oleh penyedia
+        "timezone": "Asia/Jakarta",
+        "source": source + " (pihak ketiga, menyatakan mengacu Bimas Islam Kemenag RI)",
+        "note": "Jadwal tingkat kabupaten; cocokkan dengan masjid setempat.",
+        "updated_at": now.isoformat(timespec="seconds"),
+        "days": rows,
+    }
+
+
+def main() -> int:
+    now = datetime.now(TZ)
+    for source in ("myQuran v3", "myQuran v2"):
+        try:
+            rows = collect(source, now.date())
+            payload = make_payload(rows, source, now)
+            temp = OUTPUT.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+            temp.replace(OUTPUT)
+            print(f"[SHALAT] BERHASIL {len(rows)} hari, {source}, {rows[0]['date']} s.d. {rows[-1]['date']}")
+            return 0
+        except Exception as exc:
+            print(f"[SHALAT] {source} gagal: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print("[SHALAT] Semua sumber gagal; shalat.json lama tidak diubah.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
